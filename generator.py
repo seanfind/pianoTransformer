@@ -3,6 +3,7 @@ import mido
 import os
 import numpy as np
 import random
+import torch
 
 
 def midi_to_notes(path: str):
@@ -155,11 +156,62 @@ def notes_from_disk(path):
     with open(path, 'rb') as f:
         data = f.read()
         print('Bytes:', len(data))
+        print('Blocks of 13:', len(data) // 13, '\nclean divide =', len(data) % 13 == 0)
+
+        split_index = int(0.9 * len(data))  # first 90% of notes are train, rest is validation
+        train_data = data[:split_index]
+        val_data = data[split_index:]
+
         for i in range(len(data) // 13):
             note = data[(i * 13):(i * 13) + 13]
             ivl = int.from_bytes(note[:8], byteorder='big', signed=True)
             dur = int.from_bytes(note[8:], byteorder='big', signed=False)
             print(ivl, dur)
+            if i > 20:
+                break
+
+
+with open('notes', 'rb') as f:
+    data = f.read()
+    print('Bytes:', len(data))
+    print('Blocks of 13:', len(data) // 13, '\nclean divide =', len(data) % 13 == 0)
+
+    split_index = int(0.9 * len(data))  # first 90% of notes are train, rest is validation
+    train_data = data[:split_index]
+    val_data = data[split_index:]
+
+
+batch_size = 32
+block_size = 128 * 13  # 128 13-bit notes
+
+
+# currently at 72 examples/s
+# TODO: improve efficiency -> for loops!
+def get_batch(phase='train'):
+    data = train_data if phase == 'train' else val_data
+    # 4 randomly generated offsets into training set, each a multiple of 13 (13-bit notes)
+    ix = torch.multiply(torch.randint((len(data) // 13) - block_size, (batch_size,)), 13)
+    x_b = [data[i:i + block_size] for i in ix]
+    x = [[] for _ in range(batch_size)]
+    for b_n, b in enumerate(x_b):
+        for i in range(len(b) // 13):
+            note = b[(i * 13):(i * 13) + 13]
+            ivl = int.from_bytes(note[:8], byteorder='big', signed=True)
+            dur = int.from_bytes(note[8:], byteorder='big', signed=False)
+            x[b_n].append([ivl, dur])
+
+    y_b = [data[i + 13:i + block_size + 13] for i in ix]
+    y = [[] for _ in range(batch_size)]
+    for b_n, b in enumerate(y_b):
+        for i in range(len(b) // 13):
+            note = b[(i * 13):(i * 13) + 13]
+            ivl = int.from_bytes(note[:8], byteorder='big', signed=True)
+            dur = int.from_bytes(note[8:], byteorder='big', signed=False)
+            y[b_n].append([ivl, dur])
+
+    x = torch.Tensor(x)
+    y = torch.Tensor(y)
+    return x, y
 
 
 midi = os.listdir('midi')
@@ -169,19 +221,26 @@ if ".DS_Store" in midi:
     midi.remove(".DS_Store")
 
 t0 = time.perf_counter()
-n = 1
+n = 1000
+#
+# for m in midi[:n]:
+#     print(m)
+#     seq = midi_to_notes('./midi/' + m)
+#     durs = seq.T[1]
+#     # durs_s = sorted(durs, reverse=True)
+#     # print(durs_s)
+#     ivls = seq.T[0]
+#     print(durs.max(), durs.min())
+#     print(ivls.max(), ivls.min())
+#     # notes_to_disk(seq)
+#
 
-for m in midi[:n]:
-    print(m)
-    seq = midi_to_notes('./midi/' + m)
-    durs = seq.T[1]
-    # durs_s = sorted(durs, reverse=True)
-    # print(durs_s)
-    ivls = seq.T[0]
-    print(durs.max(), durs.min())
-    print(ivls.max(), ivls.min())
-    # notes_to_disk(seq)
+# notes_from_disk('notes')
 
-print((time.perf_counter() - t0) / n)
+
+for i in range(n):
+    x, y = get_batch()
+
+print((time.perf_counter() - t0))
 
 # notes_to_midi(seq)
