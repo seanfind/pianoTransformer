@@ -181,36 +181,30 @@ with open('notes', 'rb') as f:
     val_data = data[split_index:]
 
 
-batch_size = 32
-block_size = 128 * 13  # 128 13-bit notes
+batch_size = 64
+block_size = 256 * 13  # n x 13-bit notes
 
 
-# currently at 72 examples/s
-# TODO: improve efficiency -> for loops!
+# v1 at 72 examples/s
+# v2 at 154 examples/s
+# v3 at 2000 examples/s
 def get_batch(phase='train'):
     data = train_data if phase == 'train' else val_data
     # 4 randomly generated offsets into training set, each a multiple of 13 (13-bit notes)
     ix = torch.multiply(torch.randint((len(data) // 13) - block_size, (batch_size,)), 13)
-    x_b = [data[i:i + block_size] for i in ix]
-    x = [[] for _ in range(batch_size)]
-    for b_n, b in enumerate(x_b):
-        for i in range(len(b) // 13):
-            note = b[(i * 13):(i * 13) + 13]
-            ivl = int.from_bytes(note[:8], byteorder='big', signed=True)
-            dur = int.from_bytes(note[8:], byteorder='big', signed=False)
-            x[b_n].append([ivl, dur])
+    byte_batches = [data[i:i + block_size + 13] for i in ix]
+    note_batches = [
+        [
+            [
+                int.from_bytes(batch[(i * 13):(i * 13)+13][:8], byteorder='big', signed=True),
+                int.from_bytes(batch[(i * 13):(i * 13) + 13][8:], byteorder='big', signed=False)
+            ]
+            for i in range(0, len(batch) // 13, n)
+        ] for batch in byte_batches
+    ]
 
-    y_b = [data[i + 13:i + block_size + 13] for i in ix]
-    y = [[] for _ in range(batch_size)]
-    for b_n, b in enumerate(y_b):
-        for i in range(len(b) // 13):
-            note = b[(i * 13):(i * 13) + 13]
-            ivl = int.from_bytes(note[:8], byteorder='big', signed=True)
-            dur = int.from_bytes(note[8:], byteorder='big', signed=False)
-            y[b_n].append([ivl, dur])
-
-    x = torch.Tensor(x)
-    y = torch.Tensor(y)
+    x = torch.Tensor(note_batches)[:, :-1]
+    y = torch.Tensor(note_batches)[:, 1:]
     return x, y
 
 
@@ -222,7 +216,7 @@ if ".DS_Store" in midi:
 
 t0 = time.perf_counter()
 n = 1000
-#
+
 # for m in midi[:n]:
 #     print(m)
 #     seq = midi_to_notes('./midi/' + m)
@@ -233,7 +227,7 @@ n = 1000
 #     print(durs.max(), durs.min())
 #     print(ivls.max(), ivls.min())
 #     # notes_to_disk(seq)
-#
+
 
 # notes_from_disk('notes')
 
