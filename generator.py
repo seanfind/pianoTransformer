@@ -1,3 +1,4 @@
+import array
 import time
 import mido
 import os
@@ -171,40 +172,68 @@ def notes_from_disk(path):
                 break
 
 
-with open('notes', 'rb') as f:
-    data = f.read()
-    print('Bytes:', len(data))
-    print('Blocks of 13:', len(data) // 13, '\nclean divide =', len(data) % 13 == 0)
-
-    split_index = int(0.9 * len(data))  # first 90% of notes are train, rest is validation
-    train_data = data[:split_index]
-    val_data = data[split_index:]
-
-
-batch_size = 64
-block_size = 256 * 13  # n x 13-bit notes
+# with open('notes', 'rb') as f:
+#     data = f.read()
+#     print('Bytes:', len(data))
+#     print('Blocks of 13:', len(data) // 13, '\nclean divide =', len(data) % 13 == 0)
+#
+#     split_index = int(0.9 * len(data))  # first 90% of notes are train, rest is validation
+#     train_data = data[:split_index]
+#     val_data = data[split_index:]
 
 
+batch_size = 32
+block_size = 128 * 13  # n x 13-bit notes
+
+
+# with batch = 32 and block = 128
 # v1 at 72 examples/s
 # v2 at 154 examples/s
-# v3 at 2000 examples/s
 def get_batch(phase='train'):
     data = train_data if phase == 'train' else val_data
-    # 4 randomly generated offsets into training set, each a multiple of 13 (13-bit notes)
+    # Randomly generated offsets into training set, each at a multiple of 13
     ix = torch.multiply(torch.randint((len(data) // 13) - block_size, (batch_size,)), 13)
-    byte_batches = [data[i:i + block_size + 13] for i in ix]
+    note_batches = [data[i:i + block_size + 13] for i in ix]
     note_batches = [
         [
             [
-                int.from_bytes(batch[(i * 13):(i * 13)+13][:8], byteorder='big', signed=True),
+                int.from_bytes(batch[(i * 13):(i * 13) + 13][:8], byteorder='big', signed=True),
                 int.from_bytes(batch[(i * 13):(i * 13) + 13][8:], byteorder='big', signed=False)
             ]
-            for i in range(0, len(batch) // 13, n)
-        ] for batch in byte_batches
+            for i in range(0, len(batch) // 13)
+        ] for batch in note_batches
     ]
 
     x = torch.Tensor(note_batches)[:, :-1]
     y = torch.Tensor(note_batches)[:, 1:]
+    return x, y
+
+# ------------ NumPy implementation ------------
+# uses 8-bit dataset file with 128 added to all intervals
+# this allows for all unsigned 8-bit integers
+
+
+# Load notes into numpy array
+data = np.fromfile('notes_8.bin', dtype=np.dtype('uint8'))
+data = data.reshape((data.shape[0] // 8, 8))
+data = data[:, -1].reshape(data.shape[0] // 2, 2)
+print(f'Data loaded: {data.shape}')
+train_data, val_data = np.array_split(data, [int(data.shape[0] * 0.9)])
+
+
+batch_size = 64
+block_size = 256
+
+
+# Much faster: ~2500 examples/s
+def get_batch_8bit(phase='train'):
+    data = train_data if phase == 'train' else val_data
+    # Randomly generated offsets into training set, each at a multiple of 13
+    ix = np.random.randint(0, data.shape[0] - block_size, (batch_size,))
+    x = np.stack([data[x:x+block_size] for x in ix])
+    y = np.stack([data[x+1:x+block_size+1] for x in ix])
+    x = torch.from_numpy(x)
+    y = torch.from_numpy(y)
     return x, y
 
 
@@ -232,8 +261,11 @@ n = 1000
 # notes_from_disk('notes')
 
 
-for i in range(n):
-    x, y = get_batch()
+for i in range(100000):
+    x, y = get_batch_8bit()
+    if time.perf_counter() - t0 >= 1:
+        print(f'n = {i}')
+        break
 
 print((time.perf_counter() - t0))
 
