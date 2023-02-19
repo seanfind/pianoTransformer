@@ -23,11 +23,37 @@ data = data.reshape((data.shape[0] // 8, 8))
 # Every 8 values contain 7 zeros and 1 value
 # -> reshape and remove zeros
 data = data[:, -1].reshape(data.shape[0] // 2, 2)
+
+
 print(f'Data loaded: {data.shape}')
+
+
+# Convert [aaa, bb] into [aaabb]
+def tokenise(x):
+    return (x[0] * 100) + x[1]
+
+
+data = np.array([tokenise(x) for x in data])
+
+print(f'Data processed: {data.shape}')
+
+unique_tokens = np.unique(data).tolist()
+vocab_size = len(unique_tokens)
+
+print(f'Vocab size: {vocab_size}')
+
+# Map tokens to integers
+token_int = {token: i for i, token in enumerate(unique_tokens)}
+int_token = {i: token for i, token in enumerate(unique_tokens)}
+encode = lambda x: token_int[x]
+decode = lambda x: int_token[x]
+
+
+# TODO: encode entire dataset at once?
+data = np.array(list(map(encode, data)))
+
 # First 90% of notes are train, rest are val
 train_data, val_data = np.array_split(data, [int(data.shape[0] * 0.9)])
-
-vocab_size = 256 + 32  # 256 intervals + 32 durations
 
 
 def get_batch(phase='train'):
@@ -43,12 +69,6 @@ def get_batch(phase='train'):
     return x, y
 
 
-x, y = get_batch()
-x_ivl, x_dur = torch.split(x, 1, dim=2)
-x_ivl = x_ivl[:, :, 0]
-x_dur = x_dur[:, :, 0]
-
-
 @torch.no_grad()
 def estimate_loss():
     out = {}
@@ -58,14 +78,15 @@ def estimate_loss():
         for k in range(eval_iters):
             # TODO: Intervals/durations?
             X, Y = get_batch(split)
-            x_ivl, x_dur = torch.split(X, 1, dim=2)
-            x_ivl = x_ivl[:, :, 0]
-            x_dur = x_dur[:, :, 0]
-            y_ivl, y_dur = torch.split(Y, 1, dim=2)
-            y_ivl = y_ivl[:, :, 0]
-            y_dur = y_dur[:, :, 0]
+            # print(X, Y)
+            # x_ivl, x_dur = torch.split(X, 1, dim=2)
+            # x_ivl = x_ivl[:, :, 0]
+            # x_dur = x_dur[:, :, 0]
+            # y_ivl, y_dur = torch.split(Y, 1, dim=2)
+            # y_ivl = y_ivl[:, :, 0]
+            # y_dur = y_dur[:, :, 0]
 
-            logits, loss = model(x_ivl, y_ivl)
+            logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -222,19 +243,19 @@ for iter in range(max_iters):
 
     # sample a batch of data
     xb, yb = get_batch('train')
-    x_ivl, x_dur = torch.split(xb, 1, dim=2)
-    x_ivl = x_ivl[:, :, 0]
-    x_dur = x_dur[:, :, 0]
-    y_ivl, y_dur = torch.split(yb, 1, dim=2)
-    y_ivl = y_ivl[:, :, 0]
-    y_dur = y_dur[:, :, 0]
+    # x_ivl, x_dur = torch.split(xb, 1, dim=2)
+    # x_ivl = x_ivl[:, :, 0]
+    # x_dur = x_dur[:, :, 0]
+    # y_ivl, y_dur = torch.split(yb, 1, dim=2)
+    # y_ivl = y_ivl[:, :, 0]
+    # y_dur = y_dur[:, :, 0]
 
     # evaluate the loss
-    logits, loss = model(x_ivl, y_ivl)
+    logits, loss = model(xb, yb)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
 
 # generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(m.generate(context, max_new_tokens=500)[0].tolist())
+print(m.generate(context, max_new_tokens=100000)[0].tolist())
