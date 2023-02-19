@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
 
-# hyperparameters
+# Hyperparameters
 batch_size = 16  # how many independent sequences will we process in parallel?
 block_size = 8  # what is the maximum context length for predictions?
 max_iters = 5000
@@ -25,32 +25,17 @@ data = data.reshape((data.shape[0] // 8, 8))
 data = data[:, -1].reshape(data.shape[0] // 2, 2)
 
 
+# Interleave interval and duration values
+# There is no need to add 32 to the interval values to prevent overlap between intervals and durations
+#   because the lowest interval value that occurs is 46 -> already larger than 32
+data = data.reshape((data.shape[0] * 2,))
+
 print(f'Data loaded: {data.shape}')
-
-
-# Convert [aaa, bb] into [aaabb]
-def tokenise(x):
-    return (x[0] * 100) + x[1]
-
-
-data = np.array([tokenise(x) for x in data])
-
-print(f'Data processed: {data.shape}')
 
 unique_tokens = np.unique(data).tolist()
 vocab_size = len(unique_tokens)
 
 print(f'Vocab size: {vocab_size}')
-
-# Map tokens to integers
-token_int = {token: i for i, token in enumerate(unique_tokens)}
-int_token = {i: token for i, token in enumerate(unique_tokens)}
-encode = lambda x: token_int[x]
-decode = lambda x: int_token[x]
-
-
-# TODO: encode entire dataset at once?
-data = np.array(list(map(encode, data)))
 
 # First 90% of notes are train, rest are val
 train_data, val_data = np.array_split(data, [int(data.shape[0] * 0.9)])
@@ -59,12 +44,11 @@ train_data, val_data = np.array_split(data, [int(data.shape[0] * 0.9)])
 def get_batch(phase='train'):
     data = train_data if phase == 'train' else val_data
     # Randomly generated offsets into training set, each at a multiple of 13
-    ix = np.random.randint(0, data.shape[0] - block_size, (batch_size,))
+    ix = np.random.randint(0, (data.shape[0] - block_size) / 2, (batch_size,)) * 2
     x = np.stack([data[x:x+block_size] for x in ix])
-    y = np.stack([data[x+1:x+block_size+1] for x in ix])
+    y = np.stack([data[x+(1 * 2):x+block_size+(1 * 2)] for x in ix])
     x = torch.from_numpy(x)
     y = torch.from_numpy(y)
-    # TODO: this line is probably wrong
     x, y = x.to(torch.int64), y.to(torch.int64)
     return x, y
 
@@ -76,16 +60,7 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            # TODO: Intervals/durations?
             X, Y = get_batch(split)
-            # print(X, Y)
-            # x_ivl, x_dur = torch.split(X, 1, dim=2)
-            # x_ivl = x_ivl[:, :, 0]
-            # x_dur = x_dur[:, :, 0]
-            # y_ivl, y_dur = torch.split(Y, 1, dim=2)
-            # y_ivl = y_ivl[:, :, 0]
-            # y_dur = y_dur[:, :, 0]
-
             logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
@@ -238,24 +213,15 @@ for iter in range(max_iters):
         losses = estimate_loss()
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
-    # TODO: How to train for both interval and duration?
-    # TODO: try training on entire seq tensors (interval + duration simultaneously)
-
     # sample a batch of data
-    xb, yb = get_batch('train')
-    # x_ivl, x_dur = torch.split(xb, 1, dim=2)
-    # x_ivl = x_ivl[:, :, 0]
-    # x_dur = x_dur[:, :, 0]
-    # y_ivl, y_dur = torch.split(yb, 1, dim=2)
-    # y_ivl = y_ivl[:, :, 0]
-    # y_dur = y_dur[:, :, 0]
+    x, y = get_batch('train')
 
     # evaluate the loss
-    logits, loss = model(xb, yb)
+    logits, loss = model(x, y)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
 
 # generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(m.generate(context, max_new_tokens=100000)[0].tolist())
+print(m.generate(context, max_new_tokens=500)[0].tolist())
