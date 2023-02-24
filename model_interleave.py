@@ -3,14 +3,15 @@ import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
 import mido
+# import libraries.mido as mido
 import datetime
 
 # Hyperparameters
-batch_size = 64  # how many independent sequences will we process in parallel?
-block_size = 256  # what is the maximum context length for predictions?
+batch_size = 64  # no. independent sequences processed in parallel
+block_size = 256  # maximum context length for predictions
 max_iters = 10000
 eval_interval = 500
-learning_rate = 3e-4  # decrease lr for self-attention
+learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_head = 3
@@ -22,22 +23,18 @@ n_gen_tokens = 10000
 
 # Load notes into numpy array
 data = np.fromfile('notes_8.bin', dtype=np.dtype('uint8'))
-data = data.reshape((data.shape[0] // 8, 8))
 # Every 8 values contain 7 zeros and 1 value
 # -> reshape and remove zeros
+data = data.reshape((data.shape[0] // 8, 8))
 data = data[:, -1].reshape(data.shape[0] // 2, 2)
 
 
 # Interleave interval and duration values
-# There is no need to add 32 to the interval values to prevent overlap between intervals and durations
-#   because the lowest interval value that occurs is 46 -> already larger than 32
 data = data.reshape((data.shape[0] * 2,))
 
 print(f'Data loaded: {data.shape}')
 
-print(data.tolist())
-
-unique_tokens = np.unique(data).tolist()
+unique_tokens = list(np.unique(data).tolist())
 vocab_size = len(unique_tokens)
 
 ntoi = {unique_tokens[i]: i for i in range(len(unique_tokens))}
@@ -47,11 +44,14 @@ decode = lambda i: iton[i]
 
 data = np.array(list(map(encode, data)))
 
-print(f'Data processed: {data.shape}')
 print(f'Vocab size: {vocab_size}')
 
 # First 90% of notes are train, rest are val
 train_data, val_data = np.array_split(data, [int(data.shape[0] * 0.9)])
+
+# For model log file
+t0 = datetime.datetime.now()
+loss_history = ""
 
 
 def get_batch(phase='train'):
@@ -149,7 +149,6 @@ class Block(nn.Module):
     """Transformer block: communication (attention) followed by computation (MLP)"""
 
     def __init__(self, n_embd, n_head):
-        # n_embd: embedding dimension, n_head: number of heads
         super().__init__()
         head_size = n_embd // n_head
         self.sa = MultiHeadAttention(n_head, head_size)  # communication
@@ -158,7 +157,7 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
-        x = x + self.sa(self.ln1(x))  # skip connections + pre-norm formulation (modern deviation from original paper)
+        x = x + self.sa(self.ln1(x))  # skip connections + pre-norm formulation ("modern" deviation from original paper)
         x = x + self.ffwd(self.ln2(x))
         return x
 
@@ -179,7 +178,7 @@ class Transformer(nn.Module):
     def forward(self, idx, targets=None):
         B, T = idx.shape
 
-        # idx and targets are both (B,T) tensor of integers
+        # idx and targets are both (B,T) tensors of integers
         tok_emb = self.token_embedding_table(idx)  # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T, C)
         x = tok_emb + pos_emb  # (B, T, C), contains not only identities, but also positional information
@@ -217,15 +216,14 @@ class Transformer(nn.Module):
 
 model = Transformer()
 m = model.to(device)
-
-# create a PyTorch optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 for iter in range(max_iters):
-    # every once in a while evaluate the loss on train and val sets
+    # Evaluate loss every [eval_interval] iterations
     if iter % eval_interval == 0:
         losses = estimate_loss()
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        loss_history += f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}\n"
 
     # sample a batch of data
     x, y = get_batch('train')
@@ -236,7 +234,44 @@ for iter in range(max_iters):
     loss.backward()
     optimizer.step()
 
-# generate from the model
+# For timestamping + training time calculation
+dt_now = datetime.datetime.now()
+
+# Save model to disk
+model_path = f'interleave_{str(dt_now.date()).replace("-", "_")}_{str(dt_now.time()).split(".")[0].replace(":", "_")}'
+torch.save(model.state_dict(), model_path)
+
+
+def strfdelta(tdelta, fmt):
+    d = {"days": tdelta.days}
+    d["hours"], rem = divmod(tdelta.seconds, 3600)
+    d["minutes"], d["seconds"] = divmod(rem, 60)
+    return fmt.format(**d)
+
+
+# Write model info to file
+with open(f'{model_path}_hyperparameters.txt', 'w') as f:
+    f.write(model_path + '\n\n')
+    f.write('------------ Model hyperparameters ------------\n')
+    f.write(f'Batch size: {batch_size}\n')
+    f.write(f'Block size: {block_size}\n')
+    f.write(f'Embedding dimensions: {n_embd}\n')
+    f.write(f'No. heads: {n_head}\n')
+    f.write(f'No. layers: {n_layer}\n')
+    f.write(f'Learning rate: {learning_rate}\n')
+    f.write(f'Dropout: {dropout}\n\n')
+
+    f.write('-------------- Training details --------------\n')
+    f.write(f'Training time: {strfdelta(dt_now - t0, "{days} days {hours} hours {minutes} minutes {seconds} seconds")}\n')
+    f.write(f'Max iters: {max_iters}\n')
+    f.write(f'Eval interval: {eval_interval}\n')
+    f.write(f'Eval iters: {eval_iters}\n')
+    f.write(f'Device: {device}\n\n')
+
+    f.write('-------------------- Loss --------------------\n')
+    f.write(loss_history)
+
+# Inference
 context = torch.Tensor([[encode(128), encode(0)]])
 context = context.to(device)
 context = context.to(torch.long)
@@ -244,6 +279,7 @@ seq = m.generate(context, max_new_tokens=n_gen_tokens)[0].tolist()
 seq = list(map(decode, seq))
 print(seq)
 
+# Remove offset from interval values (by subtracting 128)
 seq = np.array(seq).reshape((len(seq) // 2), 2)
 seq = seq - np.array([128, 0])
 
@@ -291,6 +327,5 @@ def notes_to_midi(seq, n0=60, dur=200, upscale=200, path='notes_out'):
     midi_out.save(f'./output/{path}.mid')
 
 
-dt_now = datetime.datetime.now()
-out_path = f'interleave_{str(dt_now.date()).replace("-", "_")}_{str(dt_now.time()).split(".")[0].replace(":", "_")}.mid'
+out_path = f'interleave_{str(dt_now.date()).replace("-", "_")}_{str(dt_now.time()).split(".")[0].replace(":", "_")}'
 notes_to_midi(seq, path=out_path)
