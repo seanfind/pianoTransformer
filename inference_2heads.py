@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
-import mido
 # import libraries.mido as mido
+import mido
 import datetime
 
 # Hyperparameters
@@ -19,17 +19,20 @@ n_embd = 64 * n_head  # -> each head is 64-dimensional
 n_layer = 6
 dropout = 0.2
 # ------------
-n_gen_tokens = 10000
+n_gen_tokens = 1000
+n_midi_files = 50
+model_path = 'models/2heads_2023_03_01_08_06_50'
+
 
 # Load notes into numpy array
-data = np.fromfile('data/notes_8.bin', dtype=np.dtype('uint8'))
+data = np.fromfile('notes_8.bin', dtype=np.dtype('uint8'))
 # Every 8 values contain 7 zeros and 1 value
 # -> reshape and remove zeros
 data = data.reshape((data.shape[0] // 8, 8))
 data = data[:, -1].reshape(data.shape[0] // 2, 2)
 
 
-# Interleave interval and duration values
+# Tokenise
 data = data.reshape((data.shape[0] * 2,))
 
 print(f'Data loaded: {data.shape}')
@@ -43,6 +46,9 @@ encode = lambda n: ntoi[n]
 decode = lambda i: iton[i]
 
 data = np.array(list(map(encode, data)))
+
+# Reshape back to (n, 2) array
+data = data.reshape((data.shape[0] // 2, 2))
 
 print(f'Vocab size: {vocab_size}')
 
@@ -74,12 +80,13 @@ def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
+        losses = torch.zeros((eval_iters, 2))
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+            logits, _, loss = model(X, Y)
+            # losses[k] = loss.item()
+            losses[k] = loss
+        out[split] = torch.mean(losses, 0, True)
     model.train()
     return out
 
@@ -167,34 +174,79 @@ class Transformer(nn.Module):
     def __init__(self):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.pitch_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.dur_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)  # each position also gets an embedding vector
         # sequential transformer blocks: intersperse communication -> computation over and over again
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(n_embd)  # final layer norm
+        self.blocks_pitch = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f_pitch = nn.LayerNorm(n_embd)  # final layer norm
         # map back to characters
-        self.lm_head = nn.Linear(n_embd, vocab_size)  # maps from embedding size to vocab size
+        self.lm_head_pitch = nn.Linear(n_embd, vocab_size)   # maps from embedding size to vocab siz
+
+        # Duration transformer blocks
+        self.blocks_dur = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f_dur = nn.LayerNorm(n_embd)  # final layer norm
+        # self.lm_head_dur = nn.Linear(n_embd * 2, 32)  # maps from embedding size to vocab size
+        self.lm_head_dur = nn.Linear(n_embd * 2, vocab_size)  # maps from embedding size to vocab size
+
+        # Map pitch logits to embedding dims
+        self.logits_to_embspace = nn.Linear(vocab_size, n_embd)
 
     def forward(self, idx, targets=None):
-        B, T = idx.shape
+        idx_p, idx_d = idx[:, :, 0], idx[:, :, 1]
+        B, T, _ = idx.shape  # ignore 2 in (B, T, 2)
 
         # idx and targets are both (B,T) tensors of integers
-        tok_emb = self.token_embedding_table(idx)  # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T, C)
-        x = tok_emb + pos_emb  # (B, T, C), contains not only identities, but also positional information
-        x = self.blocks(x)  # (B, T, C)
-        x = self.ln_f(x)  # (B, T, C)
-        logits = self.lm_head(x)  # (B, T, vocab_size)
+        pitch_emb = self.pitch_embedding_table(idx_p)
+        dur_emb = self.dur_embedding_table(idx_d)
+        # Add positional information
+        pitch_emb = pitch_emb + pos_emb
+        dur_emb = dur_emb + pos_emb
+        # tok_emb = torch.cat((self.pitch_embedding_table(idx_p), self.dur_embedding_table(idx_d)), dim=2)  # (B,T,C)
+        # x = x.transpose(0, 1).transpose(1, 2).transpose(2, 3)
+        # print(x.shape)
+        # x = x.reshape((x.shape[0], x.shape[1], x.shape[2] * 2))
+        # print(x.shape)
+
+        # Input pitch data to blocks
+        x = self.blocks_pitch(pitch_emb)  # (B, T, C)
+        x = self.ln_f_pitch(x)  # (B, T, C)
+        logits_pitch = self.lm_head_pitch(x)  # (B, T, vocab_size)
+
+        # Input pitch logits + duration data to blocks
+        logits_emb = self.logits_to_embspace(logits_pitch)
+        x = torch.stack([logits_emb, dur_emb], dim=-1)
+        x = x.reshape((x.shape[0], x.shape[1], x.shape[2] * 2))
+        # TODO: does this need to run through entire transformer block with pitch data? or through its own transformer?
+        # x = self.blocks_dur(x)  # (B, T, C)
+        # x = self.ln_f_dur(x)  # (B, T, C)
+        logits_dur = self.lm_head_dur(x)  # (B, T, vocab_size)
 
         if targets is None:
             loss = None
+            loss_pair = None
         else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
+            # Split targets into pitch and dur
+            targets_pitch, targets_dur = targets[:, :, 0], targets[:, :, 1]
 
-        return logits, loss
+            # Pitch loss
+            B, T, C = logits_pitch.shape
+            logits_pitch = logits_pitch.view(B * T, C)
+            targets_pitch = targets_pitch.view(B * T)
+            loss_pitch = F.cross_entropy(logits_pitch, targets_pitch)
+
+            # Duration loss
+            B, T, C = logits_dur.shape
+            logits_dur = logits_dur.view(B * T, C)
+            targets_dur = targets_dur.view(B * T)
+            loss_dur = F.cross_entropy(logits_dur, targets_dur)
+
+            # Loss is sum of both losses
+            loss = loss_pitch + loss_dur
+            loss_pair = torch.Tensor([loss_pitch, loss_dur])
+
+        return (logits_pitch, logits_dur), loss, loss_pair
 
     def generate(self, idx, max_new_tokens):
         # idx is (B, T) array of indices in the current context
@@ -202,86 +254,30 @@ class Transformer(nn.Module):
             # crop idx to the last {block_size} tokens
             idx_cond = idx[:, -block_size:]
             # get the predictions
-            logits, loss = self(idx_cond)
+            (logits_pitch, logits_dur), _, _ = self(idx_cond)
             # focus only on the last time step
-            logits = logits[:, -1, :] # becomes (B, C)
+            logits_pitch = logits_pitch[:, -1, :] # becomes (B, C)
+            logits_dur = logits_dur[:, -1, :] # becomes (B, C)
             # apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1)  # (B, C)
+            probs_pitch = F.softmax(logits_pitch, dim=-1)  # (B, C)
+            probs_dur = F.softmax(logits_dur, dim=-1)  # (B, C)
             # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            idx_next_pitch = torch.multinomial(probs_pitch, num_samples=1)  # (B, 1)
+            idx_next_dur = torch.multinomial(probs_dur, num_samples=1)  # (B, 1)
             # append sampled index to the running sequence
+            idx_next = torch.Tensor([[[idx_next_pitch, idx_next_dur]]])
+            idx_next = idx_next.to(device)
+            idx_next = idx_next.to(torch.long)
             idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
         return idx
 
 
 model = Transformer()
 m = model.to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+model.load_state_dict(torch.load(model_path, map_location=torch.device(device)))
+model.eval()
 
-for iter in range(max_iters):
-    # Evaluate loss every [eval_interval] iterations
-    if iter % eval_interval == 0:
-        losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        loss_history += f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}\n"
-
-    # sample a batch of data
-    x, y = get_batch('train')
-
-    # evaluate the loss
-    logits, loss = model(x, y)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
-
-# For timestamping + training time calculation
-dt_now = datetime.datetime.now()
-
-# Save model to disk
-model_path = f'interleave_{str(dt_now.date()).replace("-", "_")}_{str(dt_now.time()).split(".")[0].replace(":", "_")}'
-torch.save(model.state_dict(), model_path)
-
-
-def strfdelta(tdelta, fmt):
-    d = {"days": tdelta.days}
-    d["hours"], rem = divmod(tdelta.seconds, 3600)
-    d["minutes"], d["seconds"] = divmod(rem, 60)
-    return fmt.format(**d)
-
-
-# Write model info to file
-with open(f'{model_path}_hyperparameters.txt', 'w') as f:
-    f.write(model_path + '\n\n')
-    f.write('------------ Model hyperparameters ------------\n')
-    f.write(f'Batch size: {batch_size}\n')
-    f.write(f'Block size: {block_size}\n')
-    f.write(f'Embedding dimensions: {n_embd}\n')
-    f.write(f'No. heads: {n_head}\n')
-    f.write(f'No. layers: {n_layer}\n')
-    f.write(f'Learning rate: {learning_rate}\n')
-    f.write(f'Dropout: {dropout}\n\n')
-
-    f.write('-------------- Training details --------------\n')
-    f.write(f'Training time: {strfdelta(dt_now - t0, "{days} days {hours} hours {minutes} minutes {seconds} seconds")}\n')
-    f.write(f'Max iters: {max_iters}\n')
-    f.write(f'Eval interval: {eval_interval}\n')
-    f.write(f'Eval iters: {eval_iters}\n')
-    f.write(f'Device: {device}\n\n')
-
-    f.write('-------------------- Loss --------------------\n')
-    f.write(loss_history)
-
-# Inference
-context = torch.Tensor([[encode(128), encode(0)]])
-context = context.to(device)
-context = context.to(torch.long)
-seq = m.generate(context, max_new_tokens=n_gen_tokens)[0].tolist()
-seq = list(map(decode, seq))
-print(seq)
-
-# Remove offset from interval values (by subtracting 128)
-seq = np.array(seq).reshape((len(seq) // 2), 2)
-seq = seq - np.array([128, 0])
+print(f'Loaded model: {sum(p.numel() for p in model.parameters() if p.requires_grad)} parameters')
 
 
 def notes_to_midi(seq, n0=60, dur=200, upscale=200, path='notes_out'):
@@ -327,5 +323,20 @@ def notes_to_midi(seq, n0=60, dur=200, upscale=200, path='notes_out'):
     midi_out.save(f'./output/{path}.mid')
 
 
-out_path = f'interleave_{str(dt_now.date()).replace("-", "_")}_{str(dt_now.time()).split(".")[0].replace(":", "_")}'
-notes_to_midi(seq, path=out_path)
+for _ in range(n_midi_files):
+    # Inference
+    context = torch.Tensor([[[encode(128), encode(0)]]])
+    context = context.to(device)
+    context = context.to(torch.long)
+    seq = m.generate(context, max_new_tokens=n_gen_tokens)[0]
+    seq = torch.flatten(seq)
+    seq = seq.tolist()
+    seq = list(map(decode, seq))
+
+    # Remove offset from interval values (by subtracting 128)
+    seq = np.array(seq).reshape((len(seq) // 2), 2)
+    seq = seq - np.array([128, 0])
+
+    dt_now = datetime.datetime.now()
+    out_path = f'2heads/2heads_{str(dt_now.date()).replace("-", "_")}_{str(dt_now.time()).split(".")[0].replace(":", "_")}'
+    notes_to_midi(seq, path=out_path)

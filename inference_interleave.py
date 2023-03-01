@@ -2,70 +2,52 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
+# import libraries.mido as mido
+import mido
+import datetime
 
 # Hyperparameters
-batch_size = 16  # how many independent sequences will we process in parallel?
-block_size = 8  # what is the maximum context length for predictions?
-max_iters = 5000
+batch_size = 64  # no. independent sequences processed in parallel
+block_size = 1024  # maximum context length for predictions
+max_iters = 200
 eval_interval = 500
-learning_rate = 3e-4  # decrease lr for self-attention
+learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
-n_embd = 768  # 384 / 6 = 64 -> each head is 64-dimensional (this is standard)
 n_head = 6
-n_layer = 6  # 6 transformer blocks
+n_embd = 64 * n_head  # -> each head is 64-dimensional
+n_layer = 6
 dropout = 0.2
 # ------------
+n_gen_tokens = 1000
+n_midi_files = 50
+model_path = 'models/interleave_2023_02_25_02_04_29'
+
 
 # Load notes into numpy array
-data = np.fromfile('notes_8.bin', dtype=np.dtype('uint8'))
-data = data.reshape((data.shape[0] // 8, 8))
+data = np.fromfile('data/notes_8.bin', dtype=np.dtype('uint8'))
 # Every 8 values contain 7 zeros and 1 value
 # -> reshape and remove zeros
+data = data.reshape((data.shape[0] // 8, 8))
 data = data[:, -1].reshape(data.shape[0] // 2, 2)
 
 
 # Interleave interval and duration values
-# There is no need to add 32 to the interval values to prevent overlap between intervals and durations
-#   because the lowest interval value that occurs is 46 -> already larger than 32
 data = data.reshape((data.shape[0] * 2,))
 
 print(f'Data loaded: {data.shape}')
 
-unique_tokens = np.unique(data).tolist()
+unique_tokens = list(np.unique(data).tolist())
 vocab_size = len(unique_tokens)
 
+ntoi = {unique_tokens[i]: i for i in range(len(unique_tokens))}
+iton = {i: unique_tokens[i] for i in range(len(unique_tokens))}
+encode = lambda n: ntoi[n]
+decode = lambda i: iton[i]
+
+data = np.array(list(map(encode, data)))
+
 print(f'Vocab size: {vocab_size}')
-
-# First 90% of notes are train, rest are val
-train_data, val_data = np.array_split(data, [int(data.shape[0] * 0.9)])
-
-
-def get_batch(phase='train'):
-    data = train_data if phase == 'train' else val_data
-    # Randomly generated offsets into training set, each at a multiple of 13
-    ix = np.random.randint(0, (data.shape[0] - block_size) / 2, (batch_size,)) * 2
-    x = np.stack([data[x:x+block_size] for x in ix])
-    y = np.stack([data[x+(1 * 2):x+block_size+(1 * 2)] for x in ix])
-    x = torch.from_numpy(x)
-    y = torch.from_numpy(y)
-    x, y = x.to(torch.int64), y.to(torch.int64)
-    return x, y
-
-
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
 
 
 class Head(nn.Module):
@@ -133,7 +115,6 @@ class Block(nn.Module):
     """Transformer block: communication (attention) followed by computation (MLP)"""
 
     def __init__(self, n_embd, n_head):
-        # n_embd: embedding dimension, n_head: number of heads
         super().__init__()
         head_size = n_embd // n_head
         self.sa = MultiHeadAttention(n_head, head_size)  # communication
@@ -142,12 +123,11 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
-        x = x + self.sa(self.ln1(x))  # skip connections + pre-norm formulation (modern deviation from original paper)
+        x = x + self.sa(self.ln1(x))  # skip connections + pre-norm formulation ("modern" deviation from original paper)
         x = x + self.ffwd(self.ln2(x))
         return x
 
 
-# super simple bigram model
 class Transformer(nn.Module):
 
     def __init__(self):
@@ -164,7 +144,7 @@ class Transformer(nn.Module):
     def forward(self, idx, targets=None):
         B, T = idx.shape
 
-        # idx and targets are both (B,T) tensor of integers
+        # idx and targets are both (B,T) tensors of integers
         tok_emb = self.token_embedding_table(idx)  # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T, C)
         x = tok_emb + pos_emb  # (B, T, C), contains not only identities, but also positional information
@@ -202,26 +182,66 @@ class Transformer(nn.Module):
 
 model = Transformer()
 m = model.to(device)
+model.load_state_dict(torch.load(model_path, map_location=torch.device(device)))
+model.eval()
 
-# create a PyTorch optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+print(f'Loaded model: {sum(p.numel() for p in model.parameters() if p.requires_grad)} parameters')
 
-for iter in range(max_iters):
-    print(iter)
-    # every once in a while evaluate the loss on train and val sets
-    if iter % eval_interval == 0:
-        losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+def notes_to_midi(seq, n0=60, dur=200, upscale=200, path='notes_out'):
+    seq = seq.tolist()
+    current_time = 0
 
-    # sample a batch of data
-    x, y = get_batch('train')
+    # Restore pitch and time values, make time values absolute
+    for i in range(len(seq)):
+        if i == 0:
+            seq[i][0] += n0
+        else:
+            seq[i][0] += seq[i - 1][0]
 
-    # evaluate the loss
-    logits, loss = model(x, y)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
+        time_val = seq[i][1]
+        seq[i][1] += current_time
+        current_time += time_val
+        seq[i][1] *= upscale
 
-# generate from the model
-context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(m.generate(context, max_new_tokens=500)[0].tolist())
+        seq[i].append(1)  # note_on indicator
+        seq.append([seq[i][0], seq[i][1] + dur, 0])
+
+    seq.sort(key=lambda x: x[1])
+
+    for i in range(len(seq) - 2, -1, -1):
+        if i >= 1:
+            seq[i][1] -= seq[i - 1][1]
+        else:
+            seq[i][1] = 0
+
+    midi_out = mido.MidiFile()
+    out_track = mido.MidiTrack()
+    midi_out.tracks.append(out_track)
+
+    for n in seq:
+        # clip notes to range [25, 80]
+        note_number = int(n[0])
+        if note_number > 80:
+            note_number -= (((note_number - 80) // 12) + 1) * 12
+        elif note_number < 25:
+            note_number += (((25 - note_number) // 12) + 1) * 12
+        out_track.append(mido.Message('note_on', note=note_number, velocity=int(100 * n[2]), time=int(n[1])))
+
+    midi_out.save(f'./output/{path}.mid')
+
+
+for _ in range(n_midi_files):
+    # Inference
+    context = torch.Tensor([[encode(128), encode(0)]])
+    context = context.to(device)
+    context = context.to(torch.long)
+    seq = m.generate(context, max_new_tokens=n_gen_tokens)[0].tolist()
+    seq = list(map(decode, seq))
+
+    # Remove offset from interval values (by subtracting 128)
+    seq = np.array(seq).reshape((len(seq) // 2), 2)
+    seq = seq - np.array([128, 0])
+
+    dt_now = datetime.datetime.now()
+    out_path = f'interleave/interleave_{str(dt_now.date()).replace("-", "_")}_{str(dt_now.time()).split(".")[0].replace(":", "_")}'
+    notes_to_midi(seq, path=out_path)

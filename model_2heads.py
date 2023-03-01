@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
-import mido
 # import libraries.mido as mido
+import mido
 import datetime
 
 # Hyperparameters
@@ -29,7 +29,7 @@ data = data.reshape((data.shape[0] // 8, 8))
 data = data[:, -1].reshape(data.shape[0] // 2, 2)
 
 
-# Interleave interval and duration values
+# Tokenise
 data = data.reshape((data.shape[0] * 2,))
 
 print(f'Data loaded: {data.shape}')
@@ -43,6 +43,9 @@ encode = lambda n: ntoi[n]
 decode = lambda i: iton[i]
 
 data = np.array(list(map(encode, data)))
+
+# Reshape back to (n, 2) array
+data = data.reshape((data.shape[0] // 2, 2))
 
 print(f'Vocab size: {vocab_size}')
 
@@ -74,12 +77,13 @@ def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
+        losses = torch.zeros((eval_iters, 2))
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+            logits, _, loss = model(X, Y)
+            # losses[k] = loss.item()
+            losses[k] = loss
+        out[split] = torch.mean(losses, 0, True)
     model.train()
     return out
 
@@ -167,34 +171,77 @@ class Transformer(nn.Module):
     def __init__(self):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.pitch_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.dur_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)  # each position also gets an embedding vector
         # sequential transformer blocks: intersperse communication -> computation over and over again
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(n_embd)  # final layer norm
+        self.blocks_pitch = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f_pitch = nn.LayerNorm(n_embd)  # final layer norm
         # map back to characters
-        self.lm_head = nn.Linear(n_embd, vocab_size)  # maps from embedding size to vocab size
+        self.lm_head_pitch = nn.Linear(n_embd, vocab_size)   # maps from embedding size to vocab siz
+
+        # Duration transformer blocks
+        self.blocks_dur = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f_dur = nn.LayerNorm(n_embd)  # final layer norm
+        # self.lm_head_dur = nn.Linear(n_embd * 2, 32)  # maps from embedding size to vocab size
+        self.lm_head_dur = nn.Linear(n_embd * 2, vocab_size)  # maps from embedding size to vocab size
+
+        # Map pitch logits to embedding dims
+        self.logits_to_embspace = nn.Linear(vocab_size, n_embd)
 
     def forward(self, idx, targets=None):
-        B, T = idx.shape
+        idx_p, idx_d = idx[:, :, 0], idx[:, :, 1]
+        B, T, _ = idx.shape  # ignore 2 in (B, T, 2)
 
         # idx and targets are both (B,T) tensors of integers
-        tok_emb = self.token_embedding_table(idx)  # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T, C)
-        x = tok_emb + pos_emb  # (B, T, C), contains not only identities, but also positional information
-        x = self.blocks(x)  # (B, T, C)
-        x = self.ln_f(x)  # (B, T, C)
-        logits = self.lm_head(x)  # (B, T, vocab_size)
+        pitch_emb = self.pitch_embedding_table(idx_p)
+        dur_emb = self.dur_embedding_table(idx_d)
+        # Add positional information
+        pitch_emb = pitch_emb + pos_emb
+        dur_emb = dur_emb + pos_emb
+        # tok_emb = torch.cat((self.pitch_embedding_table(idx_p), self.dur_embedding_table(idx_d)), dim=2)  # (B,T,C)
+        # x = x.transpose(0, 1).transpose(1, 2).transpose(2, 3)
+        # print(x.shape)
+        # x = x.reshape((x.shape[0], x.shape[1], x.shape[2] * 2))
+        # print(x.shape)
+
+        # Input pitch data to blocks
+        x = self.blocks_pitch(pitch_emb)  # (B, T, C)
+        x = self.ln_f_pitch(x)  # (B, T, C)
+        logits_pitch = self.lm_head_pitch(x)  # (B, T, vocab_size)
+
+        # Input pitch logits + duration data to blocks
+        logits_emb = self.logits_to_embspace(logits_pitch)
+        x = torch.stack([logits_emb, dur_emb], dim=-1)
+        x = x.reshape((x.shape[0], x.shape[1], x.shape[2] * 2))
+        # TODO: does this need to run through entire transformer block with pitch data? or through its own transformer?
+        # x = self.blocks_dur(x)  # (B, T, C)
+        # x = self.ln_f_dur(x)  # (B, T, C)
+        logits_dur = self.lm_head_dur(x)  # (B, T, vocab_size)
 
         if targets is None:
             loss = None
         else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
+            # Split targets into pitch and dur
+            targets_pitch, targets_dur = targets[:, :, 0], targets[:, :, 1]
 
-        return logits, loss
+            # Pitch loss
+            B, T, C = logits_pitch.shape
+            logits_pitch = logits_pitch.view(B * T, C)
+            targets_pitch = targets_pitch.view(B * T)
+            loss_pitch = F.cross_entropy(logits_pitch, targets_pitch)
+
+            # Duration loss
+            B, T, C = logits_dur.shape
+            logits_dur = logits_dur.view(B * T, C)
+            targets_dur = targets_dur.view(B * T)
+            loss_dur = F.cross_entropy(logits_dur, targets_dur)
+
+            # Loss is sum of both losses
+            loss = loss_pitch + loss_dur
+
+        return (logits_pitch, logits_dur), loss, torch.Tensor([loss_pitch, loss_dur])
 
     def generate(self, idx, max_new_tokens):
         # idx is (B, T) array of indices in the current context
@@ -222,14 +269,16 @@ for iter in range(max_iters):
     # Evaluate loss every [eval_interval] iterations
     if iter % eval_interval == 0:
         losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        loss_history += f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}\n"
+        train_loss, val_loss = losses['train'], losses['val']
+        loss_str = f"step {iter}: train loss {train_loss.sum():.4f} {*[int(x * 10000) / 10000 for x in train_loss.tolist()[0]],}, val loss {val_loss.sum():.4f} {*[int(x * 10000) / 10000 for x in val_loss.tolist()[0]],}\n"
+        print(loss_str)
+        loss_history += loss_str
 
     # sample a batch of data
     x, y = get_batch('train')
 
     # evaluate the loss
-    logits, loss = model(x, y)
+    logits, loss, _ = model(x, y)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
@@ -238,7 +287,7 @@ for iter in range(max_iters):
 dt_now = datetime.datetime.now()
 
 # Save model to disk
-model_path = f'interleave_{str(dt_now.date()).replace("-", "_")}_{str(dt_now.time()).split(".")[0].replace(":", "_")}'
+model_path = f'2heads_{str(dt_now.date()).replace("-", "_")}_{str(dt_now.time()).split(".")[0].replace(":", "_")}'
 torch.save(model.state_dict(), model_path)
 
 
@@ -327,5 +376,5 @@ def notes_to_midi(seq, n0=60, dur=200, upscale=200, path='notes_out'):
     midi_out.save(f'./output/{path}.mid')
 
 
-out_path = f'interleave_{str(dt_now.date()).replace("-", "_")}_{str(dt_now.time()).split(".")[0].replace(":", "_")}'
+out_path = f'2heads_{str(dt_now.date()).replace("-", "_")}_{str(dt_now.time()).split(".")[0].replace(":", "_")}'
 notes_to_midi(seq, path=out_path)

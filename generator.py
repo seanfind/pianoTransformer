@@ -217,11 +217,32 @@ def get_batch(phase='train'):
 data = np.fromfile('notes_8.bin', dtype=np.dtype('uint8'))
 data = data.reshape((data.shape[0] // 8, 8))
 data = data[:, -1].reshape(data.shape[0] // 2, 2)
+
+
+
+
+# TODO: Currently only subset of dataset!!!!!!
+data = data[:1000000]
+
+
+
+
+
 print(f'Data loaded: {data.shape}')
+
+
+# Convert [aaa, bb] into [aaabb]
+def tokenise(x):
+    return (x[0] * 100) + x[1]
+
+
+data = np.array([tokenise(x) for x in data])
+print(f'Data processed: {data.shape}')
+print(data)
 train_data, val_data = np.array_split(data, [int(data.shape[0] * 0.9)])
 
 
-batch_size = 64
+batch_size = 128
 block_size = 256
 
 
@@ -234,6 +255,28 @@ def get_batch_8bit(phase='train'):
     y = np.stack([data[x+1:x+block_size+1] for x in ix])
     x = torch.from_numpy(x)
     y = torch.from_numpy(y)
+    return x, y
+
+
+# TODO: make this faster (currently at ~60 iter/s)
+# TODO: try implementing tokenisation in dataset loading?
+def get_batch_bundle(phase='train'):
+    data = train_data if phase == 'train' else val_data
+    # Randomly generated offsets into training set, each at a multiple of 13
+    ix = np.random.randint(0, data.shape[0] - block_size, (batch_size,))
+    xy = np.stack([data[x:x+block_size+1] for x in ix])
+
+    xy = xy.reshape((batch_size * (block_size + 1), 2))
+
+    xy_list = xy.T.tolist()
+    xy_tokens = []
+    for i in range(batch_size*(block_size + 1)):
+        ivl, dur = xy_list[0][i], xy_list[1][i]
+        xy_tokens.append(int(f'{ivl}' + f'{dur:02d}'))
+    xy_tokens = np.array(xy_tokens)
+    xy_tokens = xy_tokens.reshape((batch_size, block_size + 1))
+    x = xy_tokens[:, :-1]
+    y = xy_tokens[:, 1:]
     return x, y
 
 
@@ -261,8 +304,12 @@ n = 1000
 # notes_from_disk('notes')
 
 
-for i in range(100000):
+for i in range(10000):
     x, y = get_batch_8bit()
+    # print('------------- x -------------')
+    # print(x)
+    # print('------------- y -------------')
+    # print(y)
     if time.perf_counter() - t0 >= 1:
         print(f'n = {i}')
         break
