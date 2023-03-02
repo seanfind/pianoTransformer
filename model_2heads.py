@@ -249,14 +249,20 @@ class Transformer(nn.Module):
             # crop idx to the last {block_size} tokens
             idx_cond = idx[:, -block_size:]
             # get the predictions
-            logits, loss = self(idx_cond)
+            (logits_pitch, logits_dur), _, _ = self(idx_cond)
             # focus only on the last time step
-            logits = logits[:, -1, :] # becomes (B, C)
+            logits_pitch = logits_pitch[:, -1, :]  # becomes (B, C)
+            logits_dur = logits_dur[:, -1, :]  # becomes (B, C)
             # apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1)  # (B, C)
+            probs_pitch = F.softmax(logits_pitch, dim=-1)  # (B, C)
+            probs_dur = F.softmax(logits_dur, dim=-1)  # (B, C)
             # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            idx_next_pitch = torch.multinomial(probs_pitch, num_samples=1)  # (B, 1)
+            idx_next_dur = torch.multinomial(probs_dur, num_samples=1)  # (B, 1)
             # append sampled index to the running sequence
+            idx_next = torch.Tensor([[[idx_next_pitch, idx_next_dur]]])
+            idx_next = idx_next.to(device)
+            idx_next = idx_next.to(torch.long)
             idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
         return idx
 
@@ -319,62 +325,3 @@ with open(f'{model_path}_hyperparameters.txt', 'w') as f:
 
     f.write('-------------------- Loss --------------------\n')
     f.write(loss_history)
-
-# Inference
-context = torch.Tensor([[encode(128), encode(0)]])
-context = context.to(device)
-context = context.to(torch.long)
-seq = m.generate(context, max_new_tokens=n_gen_tokens)[0].tolist()
-seq = list(map(decode, seq))
-print(seq)
-
-# Remove offset from interval values (by subtracting 128)
-seq = np.array(seq).reshape((len(seq) // 2), 2)
-seq = seq - np.array([128, 0])
-
-
-def notes_to_midi(seq, n0=60, dur=200, upscale=200, path='notes_out'):
-    seq = seq.tolist()
-    current_time = 0
-
-    # Restore pitch and time values, make time values absolute
-    for i in range(len(seq)):
-        if i == 0:
-            seq[i][0] += n0
-        else:
-            seq[i][0] += seq[i - 1][0]
-
-        time_val = seq[i][1]
-        seq[i][1] += current_time
-        current_time += time_val
-        seq[i][1] *= upscale
-
-        seq[i].append(1)  # note_on indicator
-        seq.append([seq[i][0], seq[i][1] + dur, 0])
-
-    seq.sort(key=lambda x: x[1])
-
-    for i in range(len(seq) - 2, -1, -1):
-        if i >= 1:
-            seq[i][1] -= seq[i - 1][1]
-        else:
-            seq[i][1] = 0
-
-    midi_out = mido.MidiFile()
-    out_track = mido.MidiTrack()
-    midi_out.tracks.append(out_track)
-
-    for n in seq:
-        # clip notes to range [25, 80]
-        note_number = int(n[0])
-        if note_number > 80:
-            note_number -= (((note_number - 80) // 12) + 1) * 12
-        elif note_number < 25:
-            note_number += (((25 - note_number) // 12) + 1) * 12
-        out_track.append(mido.Message('note_on', note=note_number, velocity=int(100 * n[2]), time=int(n[1])))
-
-    midi_out.save(f'./output/{path}.mid')
-
-
-out_path = f'2heads_{str(dt_now.date()).replace("-", "_")}_{str(dt_now.time()).split(".")[0].replace(":", "_")}'
-notes_to_midi(seq, path=out_path)

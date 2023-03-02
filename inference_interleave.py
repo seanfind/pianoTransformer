@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
-# import libraries.mido as mido
-import mido
 import datetime
+from postprocessing import notes_to_midi
+import json
 
 # Hyperparameters
 batch_size = 64  # no. independent sequences processed in parallel
@@ -46,6 +46,12 @@ encode = lambda n: ntoi[n]
 decode = lambda i: iton[i]
 
 data = np.array(list(map(encode, data)))
+
+# Uncomment for faster computation when running locally (comment line above)
+# with open('data/data_encoded.txt', 'r') as f:
+#     data = f.read()
+#     data = json.loads(data)
+#     data = np.array(data)
 
 print(f'Vocab size: {vocab_size}')
 
@@ -187,49 +193,8 @@ model.eval()
 
 print(f'Loaded model: {sum(p.numel() for p in model.parameters() if p.requires_grad)} parameters')
 
-def notes_to_midi(seq, n0=60, dur=200, upscale=200, path='notes_out'):
-    seq = seq.tolist()
-    current_time = 0
 
-    # Restore pitch and time values, make time values absolute
-    for i in range(len(seq)):
-        if i == 0:
-            seq[i][0] += n0
-        else:
-            seq[i][0] += seq[i - 1][0]
-
-        time_val = seq[i][1]
-        seq[i][1] += current_time
-        current_time += time_val
-        seq[i][1] *= upscale
-
-        seq[i].append(1)  # note_on indicator
-        seq.append([seq[i][0], seq[i][1] + dur, 0])
-
-    seq.sort(key=lambda x: x[1])
-
-    for i in range(len(seq) - 2, -1, -1):
-        if i >= 1:
-            seq[i][1] -= seq[i - 1][1]
-        else:
-            seq[i][1] = 0
-
-    midi_out = mido.MidiFile()
-    out_track = mido.MidiTrack()
-    midi_out.tracks.append(out_track)
-
-    for n in seq:
-        # clip notes to range [25, 80]
-        note_number = int(n[0])
-        if note_number > 80:
-            note_number -= (((note_number - 80) // 12) + 1) * 12
-        elif note_number < 25:
-            note_number += (((25 - note_number) // 12) + 1) * 12
-        out_track.append(mido.Message('note_on', note=note_number, velocity=int(100 * n[2]), time=int(n[1])))
-
-    midi_out.save(f'./output/{path}.mid')
-
-
+# Generate MIDI files
 for _ in range(n_midi_files):
     # Inference
     context = torch.Tensor([[encode(128), encode(0)]])
