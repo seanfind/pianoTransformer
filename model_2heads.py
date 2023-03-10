@@ -3,22 +3,21 @@ import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
 import datetime
-import json
+import math
 
 # Hyperparameters
-batch_size = 64  # no. independent sequences processed in parallel
-block_size = 1024  # maximum context length for predictions
-max_iters = 25000
+batch_size = 4  # no. independent sequences processed in parallel
+block_size = 16  # maximum context length for predictions
+max_iters = 1000
 eval_interval = 500
 learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
-n_head = 6
+n_head = 1
 n_embd = 64 * n_head  # -> each head is 64-dimensional
-n_layer = 6
-dropout = 0.2
+n_layer = 1
+dropout = 0.05
 # ------------
-n_gen_tokens = 10000
 
 # Load notes into numpy array
 data = np.fromfile('data/notes_8.bin', dtype=np.dtype('uint8'))
@@ -27,30 +26,30 @@ data = np.fromfile('data/notes_8.bin', dtype=np.dtype('uint8'))
 data = data.reshape((data.shape[0] // 8, 8))
 data = data[:, -1].reshape(data.shape[0] // 2, 2)
 
-
-# Tokenise
-data = data.reshape((data.shape[0] * 2,))
-
 print(f'Data loaded: {data.shape}')
 
-unique_tokens = list(np.unique(data).tolist())
-vocab_size = len(unique_tokens)
 
-ntoi = {unique_tokens[i]: i for i in range(len(unique_tokens))}
-iton = {i: unique_tokens[i] for i in range(len(unique_tokens))}
-encode = lambda n: ntoi[n]
-decode = lambda i: iton[i]
+# Pitch value range in dataset is [46, 210] -> subtract 46 -> range is [0, 164]
+def encode(d):
+    if isinstance(d, np.ndarray) or isinstance(d, torch.Tensor):
+        d[:, 0] -= 46
+    elif isinstance(d, int):
+        d -= 46
+    return d
 
-data = np.array(list(map(encode, data)))
 
-# Uncomment for faster computation when running locally (comment line above)
-# with open('data/data_encoded.txt', 'r') as f:
-#     data = f.read()
-#     data = json.loads(data)
-#     data = np.array(data)
+def decode(d):
+    if isinstance(d, np.ndarray) or isinstance(d, torch.Tensor):
+        d[:, 0] += 46
+    elif isinstance(d, int):
+        d += 46
+    return d
 
-# Reshape back to (n, 2) array
-data = data.reshape((data.shape[0] // 2, 2))
+
+data = encode(data)
+
+unique_tokens = np.unique(data)
+vocab_size = unique_tokens.shape[0]
 
 print(f'Vocab size: {vocab_size}')
 
@@ -66,8 +65,6 @@ def get_batch(phase='train'):
     data = train_data if phase == 'train' else val_data
     # Randomly generated offsets into training set, each at a multiple of 13
     ix = np.random.randint(0, (data.shape[0] - block_size) / 2, (batch_size,)) * 2
-    # Uncomment to overfit
-    # ix = np.zeros((batch_size,), dtype=np.int8)
     x = np.stack([data[x:x+block_size] for x in ix])
     y = np.stack([data[x+1:x+block_size+1] for x in ix])
     x = torch.from_numpy(x)
@@ -177,7 +174,7 @@ class Transformer(nn.Module):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
         self.pitch_embedding_table = nn.Embedding(vocab_size, n_embd // 2)
-        self.dur_embedding_table = nn.Embedding(vocab_size, n_embd // 2)
+        self.dur_embedding_table = nn.Embedding(33, n_embd // 2)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)  # each position also gets an embedding vector
         # sequential transformer blocks: intersperse communication -> computation over and over again
         self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
@@ -185,6 +182,21 @@ class Transformer(nn.Module):
         # map back to characters
         self.lm_head_pitch = nn.Linear(n_embd, vocab_size)   # maps from embedding size to vocab size
         self.lm_head_dur = nn.Linear(vocab_size + n_embd, vocab_size)  # maps from embedding size to vocab size
+
+        # init all weights
+        self.apply(self._init_weights)
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layer))
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         # Split idx into pitch and dur
@@ -242,7 +254,7 @@ class Transformer(nn.Module):
 
         return (logits_pitch, logits_dur), loss, loss_pair
 
-    def generate(self, idx, max_new_tokens):
+    def generate(self, idx, max_new_tokens, temperature):
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
             # crop idx to the last {block_size} tokens
@@ -253,11 +265,13 @@ class Transformer(nn.Module):
             logits_pitch = logits_pitch[:, -1, :]  # becomes (B, C)
             logits_dur = logits_dur[:, -1, :]  # becomes (B, C)
             # apply softmax to get probabilities
-            probs_pitch = F.softmax(logits_pitch, dim=-1)  # (B, C)
-            probs_dur = F.softmax(logits_dur, dim=-1)  # (B, C)
+            probs_pitch = F.softmax(logits_pitch/temperature, dim=-1)  # (B, C)
+            probs_dur = F.softmax(logits_dur/temperature, dim=-1)  # (B, C)
             # sample from the distribution
             idx_next_pitch = torch.multinomial(probs_pitch, num_samples=1)  # (B, 1)
             idx_next_dur = torch.multinomial(probs_dur, num_samples=1)  # (B, 1)
+            # clip durations to range [0, 32]
+            idx_next_dur = min(idx_next_dur, torch.Tensor([[32]]))
             # append sampled index to the running sequence
             idx_next = torch.Tensor([[[idx_next_pitch, idx_next_dur]]])
             idx_next = idx_next.to(device)
@@ -266,61 +280,62 @@ class Transformer(nn.Module):
         return idx
 
 
-model = Transformer()
-m = model.to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+if __name__ == "__main__":
+    model = Transformer()
+    m = model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-for iter in range(max_iters):
-    # Evaluate loss every [eval_interval] iterations
-    if iter % eval_interval == 0:
-        losses = estimate_loss()
-        train_loss, val_loss = losses['train'], losses['val']
-        loss_str = f"step {iter}: train loss {train_loss.sum():.4f} {*[int(x * 10000) / 10000 for x in train_loss.tolist()[0]],}, val loss {val_loss.sum():.4f} {*[int(x * 10000) / 10000 for x in val_loss.tolist()[0]],}\n"
-        print(loss_str)
-        loss_history += loss_str
+    for iter in range(max_iters):
+        # Evaluate loss every [eval_interval] iterations
+        if iter % eval_interval == 0:
+            losses = estimate_loss()
+            train_loss, val_loss = losses['train'], losses['val']
+            loss_str = f"step {iter}: train loss {train_loss.sum():.4f} {*[int(x * 10000) / 10000 for x in train_loss.tolist()[0]],}, val loss {val_loss.sum():.4f} {*[int(x * 10000) / 10000 for x in val_loss.tolist()[0]],}\n"
+            print(loss_str)
+            loss_history += loss_str
 
-    # sample a batch of data
-    x, y = get_batch('train')
+        # sample a batch of data
+        x, y = get_batch('train')
 
-    # evaluate the loss
-    logits, loss, _ = model(x, y)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
+        # evaluate the loss
+        logits, loss, _ = model(x, y)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
 
-# For timestamping + training time calculation
-dt_now = datetime.datetime.now()
+    # For timestamping + training time calculation
+    dt_now = datetime.datetime.now()
 
-# Save model to disk
-model_path = f'2heads_{str(dt_now.date()).replace("-", "_")}_{str(dt_now.time()).split(".")[0].replace(":", "_")}'
-torch.save(model.state_dict(), model_path)
-
-
-def strfdelta(tdelta, fmt):
-    d = {"days": tdelta.days}
-    d["hours"], rem = divmod(tdelta.seconds, 3600)
-    d["minutes"], d["seconds"] = divmod(rem, 60)
-    return fmt.format(**d)
+    # Save model to disk
+    model_path = f'2heads_{str(dt_now.date()).replace("-", "_")}_{str(dt_now.time()).split(".")[0].replace(":", "_")}'
+    torch.save(model.state_dict(), model_path)
 
 
-# Write model info to file
-with open(f'{model_path}_hyperparameters.txt', 'w') as f:
-    f.write(model_path + '\n\n')
-    f.write('------------ Model hyperparameters ------------\n')
-    f.write(f'Batch size: {batch_size}\n')
-    f.write(f'Block size: {block_size}\n')
-    f.write(f'Embedding dimensions: {n_embd}\n')
-    f.write(f'No. heads: {n_head}\n')
-    f.write(f'No. layers: {n_layer}\n')
-    f.write(f'Learning rate: {learning_rate}\n')
-    f.write(f'Dropout: {dropout}\n\n')
+    def strfdelta(tdelta, fmt):
+        d = {"days": tdelta.days}
+        d["hours"], rem = divmod(tdelta.seconds, 3600)
+        d["minutes"], d["seconds"] = divmod(rem, 60)
+        return fmt.format(**d)
 
-    f.write('-------------- Training details --------------\n')
-    f.write(f'Training time: {strfdelta(dt_now - t0, "{days} days {hours} hours {minutes} minutes {seconds} seconds")}\n')
-    f.write(f'Max iters: {max_iters}\n')
-    f.write(f'Eval interval: {eval_interval}\n')
-    f.write(f'Eval iters: {eval_iters}\n')
-    f.write(f'Device: {device}\n\n')
 
-    f.write('-------------------- Loss --------------------\n')
-    f.write(loss_history)
+    # Write model info to file
+    with open(f'{model_path}_hyperparameters.txt', 'w') as f:
+        f.write(model_path + '\n\n')
+        f.write('------------ Model hyperparameters ------------\n')
+        f.write(f'Batch size: {batch_size}\n')
+        f.write(f'Block size: {block_size}\n')
+        f.write(f'Embedding dimensions: {n_embd}\n')
+        f.write(f'No. heads: {n_head}\n')
+        f.write(f'No. layers: {n_layer}\n')
+        f.write(f'Learning rate: {learning_rate}\n')
+        f.write(f'Dropout: {dropout}\n\n')
+
+        f.write('-------------- Training details --------------\n')
+        f.write(f'Training time: {strfdelta(dt_now - t0, "{days} days {hours} hours {minutes} minutes {seconds} seconds")}\n')
+        f.write(f'Max iters: {max_iters}\n')
+        f.write(f'Eval interval: {eval_interval}\n')
+        f.write(f'Eval iters: {eval_iters}\n')
+        f.write(f'Device: {device}\n\n')
+
+        f.write('-------------------- Loss --------------------\n')
+        f.write(loss_history)
