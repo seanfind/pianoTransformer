@@ -2,9 +2,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
-# import libraries.mido as mido
-import mido
 import datetime
+import json
 
 # Hyperparameters
 batch_size = 64  # no. independent sequences processed in parallel
@@ -43,6 +42,12 @@ encode = lambda n: ntoi[n]
 decode = lambda i: iton[i]
 
 data = np.array(list(map(encode, data)))
+
+# Uncomment for faster computation when running locally (comment line above)
+# with open('data/data_encoded.txt', 'r') as f:
+#     data = f.read()
+#     data = json.loads(data)
+#     data = np.array(data)
 
 # Reshape back to (n, 2) array
 data = data.reshape((data.shape[0] // 2, 2))
@@ -171,57 +176,50 @@ class Transformer(nn.Module):
     def __init__(self):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
-        self.pitch_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.dur_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.pitch_embedding_table = nn.Embedding(vocab_size, n_embd // 2)
+        self.dur_embedding_table = nn.Embedding(vocab_size, n_embd // 2)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)  # each position also gets an embedding vector
         # sequential transformer blocks: intersperse communication -> computation over and over again
-        self.blocks_pitch = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
-        self.ln_f_pitch = nn.LayerNorm(n_embd)  # final layer norm
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)  # final layer norm
         # map back to characters
-        self.lm_head_pitch = nn.Linear(n_embd, vocab_size)   # maps from embedding size to vocab siz
-
-        # Duration transformer blocks
-        self.blocks_dur = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
-        self.ln_f_dur = nn.LayerNorm(n_embd)  # final layer norm
-        # self.lm_head_dur = nn.Linear(n_embd * 2, 32)  # maps from embedding size to vocab size
-        self.lm_head_dur = nn.Linear(n_embd * 2, vocab_size)  # maps from embedding size to vocab size
-
-        # Map pitch logits to embedding dims
-        self.logits_to_embspace = nn.Linear(vocab_size, n_embd)
+        self.lm_head_pitch = nn.Linear(n_embd, vocab_size)   # maps from embedding size to vocab size
+        self.lm_head_dur = nn.Linear(vocab_size + n_embd, vocab_size)  # maps from embedding size to vocab size
 
     def forward(self, idx, targets=None):
+        # Split idx into pitch and dur
         idx_p, idx_d = idx[:, :, 0], idx[:, :, 1]
         B, T, _ = idx.shape  # ignore 2 in (B, T, 2)
 
         # idx and targets are both (B,T) tensors of integers
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T, C)
         pitch_emb = self.pitch_embedding_table(idx_p)
         dur_emb = self.dur_embedding_table(idx_d)
+        model_input = torch.cat((pitch_emb, dur_emb), dim=-1)
+
         # Add positional information
-        pitch_emb = pitch_emb + pos_emb
-        dur_emb = dur_emb + pos_emb
-        # tok_emb = torch.cat((self.pitch_embedding_table(idx_p), self.dur_embedding_table(idx_d)), dim=2)  # (B,T,C)
-        # x = x.transpose(0, 1).transpose(1, 2).transpose(2, 3)
-        # print(x.shape)
-        # x = x.reshape((x.shape[0], x.shape[1], x.shape[2] * 2))
-        # print(x.shape)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T, C)
+        model_input = model_input + pos_emb
 
-        # Input pitch data to blocks
-        x = self.blocks_pitch(pitch_emb)  # (B, T, C)
-        x = self.ln_f_pitch(x)  # (B, T, C)
-        logits_pitch = self.lm_head_pitch(x)  # (B, T, vocab_size)
+        # Input data to blocks
+        activations = self.blocks(model_input)  # (B, T, C)
+        activations = self.ln_f(activations)  # (B, T, C)
 
-        # Input pitch logits + duration data to blocks
-        logits_emb = self.logits_to_embspace(logits_pitch)
-        x = torch.stack([logits_emb, dur_emb], dim=-1)
-        x = x.reshape((x.shape[0], x.shape[1], x.shape[2] * 2))
-        # TODO: does this need to run through entire transformer block with pitch data? or through its own transformer?
-        # x = self.blocks_dur(x)  # (B, T, C)
-        # x = self.ln_f_dur(x)  # (B, T, C)
-        logits_dur = self.lm_head_dur(x)  # (B, T, vocab_size)
+        logits_pitch = self.lm_head_pitch(activations)  # (B, T, vocab_size)
+
+        logits_pitch = logits_pitch.permute(*torch.arange(logits_pitch.ndim - 1, -1, -1))
+        activations = activations.permute(*torch.arange(activations.ndim - 1, -1, -1))
+
+        # Concatenate into dur_input and transpose back
+        dur_input = torch.cat((logits_pitch, activations))
+        dur_input = dur_input.permute(*torch.arange(dur_input.ndim - 1, -1, -1))
+        # Transpose pitch logits back
+        logits_pitch = logits_pitch.permute(*torch.arange(logits_pitch.ndim - 1, -1, -1))
+
+        logits_dur = self.lm_head_dur(dur_input)  # (B, T, vocab_size)
 
         if targets is None:
             loss = None
+            loss_pair = None
         else:
             # Split targets into pitch and dur
             targets_pitch, targets_dur = targets[:, :, 0], targets[:, :, 1]
@@ -240,8 +238,9 @@ class Transformer(nn.Module):
 
             # Loss is sum of both losses
             loss = loss_pitch + loss_dur
+            loss_pair = torch.Tensor([loss_pitch, loss_dur])
 
-        return (logits_pitch, logits_dur), loss, torch.Tensor([loss_pitch, loss_dur])
+        return (logits_pitch, logits_dur), loss, loss_pair
 
     def generate(self, idx, max_new_tokens):
         # idx is (B, T) array of indices in the current context
